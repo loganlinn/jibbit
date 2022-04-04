@@ -5,6 +5,7 @@
             [clojure.edn :as edn]
             [clojure.pprint :refer [pprint]]
             [jibbit.build :refer [configure-image get-path]]
+            [jibbit.util :as util]
             [jibbit.report :as report])
   (:import
    (com.google.cloud.tools.jib.api Jib Containerizer LogEvent JibContainerBuilder)
@@ -211,7 +212,10 @@
     :as c}]
   (.containerize
    (doto (Jib/from (configure-image base-image))
-     (.addLabel "org.opencontainers.image.revision" (b/git-process {:dir b/*project-root* :git-args ["rev-parse" "HEAD"]}))
+     (.addLabel "org.opencontainers.image.revision" (try 
+                                                      (b/git-process {:dir b/*project-root* :git-args ["rev-parse" "HEAD"]}) 
+                                                      (catch Throwable _
+                                                        "none")))
      (.addLabel "org.opencontainers.image.source" git-url)
      (.addLabel "com.atomist.containers.image.build" "clj -Tjib build")
      (.setWorkingDirectory (docker-path working-dir))
@@ -222,7 +226,8 @@
      (set-user! (assoc c :base-image base-image))
      (.setEntrypoint (entry-point c)))
    (-> (cond-> target-image
-         tag (assoc :tag tag))
+         tag (assoc :tag tag)
+         (:image-name target-image) (update :image-name util/env-subst #(.get (System/getenv) %)))
        add-tags
        configure-image
        (Containerizer/to)
