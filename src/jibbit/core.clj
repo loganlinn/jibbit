@@ -9,8 +9,8 @@
   (:import
    (com.google.cloud.tools.jib.api Jib Containerizer LogEvent JibContainerBuilder)
    (com.google.cloud.tools.jib.api.buildplan ImageFormat)
-   (com.google.cloud.tools.jib.api.buildplan AbsoluteUnixPath 
-                                             FileEntriesLayer 
+   (com.google.cloud.tools.jib.api.buildplan AbsoluteUnixPath
+                                             FileEntriesLayer
                                              OwnershipProvider
                                              Port
                                              FileEntriesLayer$Builder)
@@ -33,9 +33,10 @@
    :jar-name "app.jar"
    :working-dir "/home/app"
    :env-vars {}
-   #_#_:args []    ; TODO support configurable program arguments
+   :args []
    #_#_:volumes [] ; TODO support configurable volumes
    #_#_:labels {}  ; TODO support configurable labels
+   #_#_:extra-dirs {}                   ; TODO support configurable files/directories
    :exposed-ports []})
 
 (defn docker-path 
@@ -256,7 +257,8 @@
                                               (assoc :working-dir working-dir)
                                               (merge (user-group-ownership c)))))
      (set-user! (assoc c :base-image base-image))
-     (.setEntrypoint (entry-point c)))
+     (.setEntrypoint (entry-point c))
+     (cond-> (:args c) (.setProgramArguments (vec (:args c)))))
    (-> (cond-> target-image
          tag (assoc :tag tag)
          (:image-name target-image) (update :image-name util/env-subst #(.get (System/getenv) %)))
