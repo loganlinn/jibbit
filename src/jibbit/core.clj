@@ -17,6 +17,27 @@
    (java.io File)
    (java.util.function Consumer)))
 
+(def jibbit-version "0.1.12")
+(def default-jibbit-config-file "jib.edn")
+(def class-dir "target/classes")
+(def base-jib-config
+  {:debug false
+   :allow-insecure-registries false
+   :base-image {:image-name "gcr.io/distroless/java"
+                :type :registry}
+   :target-image {:type :tar
+                  :image-format :docker}
+   :aot false
+   :user nil
+   :group nil
+   :jar-name "app.jar"
+   :working-dir "/home/app"
+   :env-vars {}
+   #_#_:args []    ; TODO support configurable program arguments
+   #_#_:volumes [] ; TODO support configurable volumes
+   #_#_:labels {}  ; TODO support configurable labels
+   :exposed-ports []})
+
 (defn docker-path 
   "params
     path segments (usually starts from working-dir)
@@ -84,25 +105,31 @@
        (map :from-working-dir)
        (str/join ":")))
 
-(defn set-user! [x {:keys [user base-image]}]
+(defn openjdk-image?
+  [image-name]
+  (.startsWith (str image-name) "openjdk"))
+
+(defn distroless-image?
+  [image-name]
+  (.startsWith (str image-name) "gcr.io/distroless/java"))
+
+(defn set-user! [^JibContainerBuilder x {:keys [user base-image]}]
   (if-let [user (cond
-                  ;; user-defined
                   user user
-                  ;; gcr.io/distroless/java ships with a nobody user
-                  (.startsWith (:image-name base-image) "openjdk") "65534"
-                  (= "gcr.io/distroless/java" (:image-name base-image)) "65532")]
+                  (openjdk-image? (:image-name base-image)) "65534"
+                  (distroless-image? (:image-name base-image)) "65532")]
     (.setUser x user)
     x))
 
-(defn user-group-ownership 
+(defn user-group-ownership
   "root:root is actually smart in general - expecially when the process is running as non-root.  Processes can't alter packaged files.
    Some dev processes, like skaffold, have workflows where code changes are written directly into running pods - only works if the container user can write these files
    nobody:root for openjdk:11-slim-buster
    65532:root for distroless"
   [{:keys [base-image]}]
   (cond
-    (and (:image-name base-image) (.startsWith (:image-name base-image) "openjdk")) {:user "65534" :group "0"}
-    (= "gcr.io/distroless/java" (:image-name base-image)) {:user "65532" :group "0"}
+    (openjdk-image? (:image-name base-image)) {:user "65534" :group "0"}
+    (distroless-image? (:image-name base-image)) {:user "65532" :group "0"}
     :else {:user "0" :group "0"}))
 
 (defn add-tags [{:keys [tagger type tag] :as target-image}]
@@ -159,7 +186,7 @@
 
 (defn ownership-provider [user group]
   (reify OwnershipProvider
-    (get [_ source-file path-in-container]
+    (get [_ _source-file _path-in-container]
       (format "%s:%s" user group))))
 
 (defn clojure-app-layers
@@ -210,17 +237,7 @@
          else copy source/resource paths too
      - try to set a non-root user
      - add org.opencontainer LABEL image metadata from current HEAD commit"
-  [{:keys [git-url base-image target-image working-dir tag debug allow-insecure-registries env-vars exposed-ports]
-    :or {base-image {:image-name "gcr.io/distroless/java"
-                     :type :registry}
-         target-image {:type :tar}
-         git-url (or
-                  (b/git-process {:dir b/*project-root* :git-args ["ls-remote" "--get-url"]})
-                  (do
-                    (println "could not discover git remote")
-                    "https://github.com/unknown/unknown"))
-         env-vars {}}
-    :as c}]
+  [{:keys [git-url base-image target-image working-dir tag debug allow-insecure-registries env-vars exposed-ports] :as c}]
   (.containerize
    (doto (Jib/from (configure-image base-image))
      (.addLabel "org.opencontainers.image.revision" (or (b/git-process {:dir b/*project-root* :git-args ["rev-parse" "HEAD"]}) "unknown"))
@@ -247,7 +264,7 @@
        configure-image
        (Containerizer/to)
        (.setToolName "clojure jib builder")
-       (.setToolVersion "0.1.12")
+       (.setToolVersion jibbit-version)
        (.setAllowInsecureRegistries (true? allow-insecure-registries))
        (.addEventHandler
         LogEvent
@@ -256,15 +273,12 @@
             (when (or debug (not (#{"DEBUG" "INFO"} (str (.getLevel event)))))
               (printf "jib:%-10s%s\n" (.getLevel event) (.getMessage event)))))))))
 
-(def default-jibbit-config-file "jib.edn")
-(def class-dir "target/classes")
-
 (defn load-config
-  "load jib config from either JIB_CONFIG env variable, or from a jib.edn file in the project-dir"
-  [dir]
+  "load jib config from either JIB_CONFIG env variable, or from a jib.edn file in the current project"
+  []
   (when-let [edn-file (if-let [e (System/getenv "JIB_CONFIG")]
                         (io/file e)
-                        (io/file dir default-jibbit-config-file))]
+                        (io/file (io/file b/*project-root*) default-jibbit-config-file))]
     (when (.exists edn-file)
       (edn/read-string (slurp edn-file)))))
 
@@ -290,23 +304,57 @@
 (defn clean [_]
   (b/delete {:path class-dir}))
 
+(defn create-basis
+  [params & {:as overrides}]
+  (-> params
+      (merge overrides)
+      (select-keys [:root :user :project :extra :aliases])
+      b/create-basis))
+
+(defn lifted-basis
+  "This creates a basis where source deps have their primary
+  external dependencies lifted to the top-level, such as is
+  needed by Polylith and possibly other monorepo setups."
+  ([] (lifted-basis nil))
+  ([params]
+   (let [default-libs  (:libs (create-basis params))
+         maven-coord?  #(some? (:mvn/version %))
+         source-dep?   #(not (maven-coord? (get default-libs %)))
+         lifted-deps (reduce-kv (fn [deps lib {:keys [dependents] :as coords}]
+                                  (if (and (maven-coord? coords) (some source-dep? dependents))
+                                    (assoc deps lib (select-keys coords [:mvn/version :exclusions]))
+                                    deps))
+                                {} default-libs)]
+     (-> (create-basis params :extra {:deps lifted-deps})
+         (update :libs #(into {} (filter (comp maven-coord? val)) %))))))
+
 (defn create-jib-config
   "create jib-config from tools cli params"
-  [{:keys [project-dir config aliases] :as params}]
+  [{:keys [project-dir config basis] :as params}]
   (when project-dir
     (b/set-project-root! project-dir))
-  (let [c (or config (load-config (if project-dir (io/file project-dir) (io/file "."))) {})
-        basis (b/create-basis {:project "deps.edn" :aliases (or aliases (:aliases c) [])})
-        jar-name (or (:jar-name c) "app.jar")
-        working-dir (or (:working-dir c) "/home/app")
-        jib-config (merge
-                    c
-                    {:jar-file (str b/*project-root* "/target/" jar-name)
-                     :jar-name jar-name
-                     :working-dir working-dir
-                     :basis basis}
-                    (dissoc params :config))]
-    (when-not (or (-> basis :argmap :main-opts) (:main jib-config))
+  (let [c (merge base-jib-config
+                 (load-config)
+                 config
+                 (select-keys params [:aliases :transitive]))
+        basis (or basis
+                  (if (:transitive c)
+                    (lifted-basis params)
+                    (create-basis params)))
+        git-url (or (:git-url c)
+                    (b/git-process {:dir b/*project-root* :git-args ["ls-remote" "--get-url"]})
+                    (do
+                      (println "warning: config does not specify :git-url and unable to discover git remote in project")
+                      ;; TODO consider using nil; not everyone uses git/github :]
+                      "https://github.com/unknown/unknown"))
+        jar-file (str (io/file (b/resolve-path "target") (:jar-name c)))
+        ;; TODO move :user, :group resolution to here
+        jib-config (merge c
+                          {:jar-file jar-file
+                           :git-url git-url
+                           :basis basis}
+                          (dissoc params :config))]
+    (when-not (or (-> jib-config :basis :argmap :main-opts) (:main jib-config))
       (throw (ex-info "config must specify either :main or an alias with :main-opts" {})))
     jib-config))
 
